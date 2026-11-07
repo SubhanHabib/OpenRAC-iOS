@@ -424,23 +424,29 @@ struct Run {
     const fs::path to = data;
     const fs::path log = data / "setup.log";
     const fs::path bundle = NSBundle.mainBundle.bundlePath.fileSystemRepresentation;
-    std::thread([image, scoped, to, log, bundle, shared] {
-        const BOOL accessing = scoped && [image startAccessingSecurityScopedResource];
-        // A file of iCloud Drive or another provider is downloaded first.
-        NSFileCoordinator* coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
-        NSError* error = nil;
-        [coordinator coordinateReadingItemAtURL:image
-                                        options:NSFileCoordinatorReadingWithoutChanges
-                                          error:&error
-                                     byAccessor:^(NSURL* url) {
-                                       shared->status = run_setup(bundle, url.fileSystemRepresentation, to, log);
-                                     }];
-        if (error != nil) {
-            std::ofstream(log, std::ios::app) << "setup-error: the image could not be opened: "
-                                              << error.localizedDescription.UTF8String << "\n";
-        }
-        if (accessing) {
-            [image stopAccessingSecurityScopedResource];
+    // Not ARC: the picker's URL is gone once its delegate call returns, so the thread owns a copy.
+    NSURL* held = [image copy];
+    std::thread([held, scoped, to, log, bundle, shared] {
+        @autoreleasepool {
+            const BOOL accessing = scoped && [held startAccessingSecurityScopedResource];
+            // A file of iCloud Drive or another provider is downloaded first.
+            NSFileCoordinator* coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
+            NSError* error = nil;
+            [coordinator coordinateReadingItemAtURL:held
+                                            options:NSFileCoordinatorReadingWithoutChanges
+                                              error:&error
+                                         byAccessor:^(NSURL* url) {
+                                           shared->status = run_setup(bundle, url.fileSystemRepresentation, to, log);
+                                         }];
+            if (error != nil) {
+                std::ofstream(log, std::ios::app) << "setup-error: the image could not be opened: "
+                                                  << error.localizedDescription.UTF8String << "\n";
+            }
+            if (accessing) {
+                [held stopAccessingSecurityScopedResource];
+            }
+            [coordinator release];
+            [held release];
         }
         shared->finished = true;
     }).detach();
