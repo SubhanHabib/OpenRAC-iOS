@@ -1,0 +1,84 @@
+# Builds the iPhone and iPad app as an .ipa for sideloading (tools/build_ios.py --ipa: no disc,
+# with the on-device setup, signed ad hoc). Every run keeps it as the run's artifact; a tag `v*`
+# also puts it on a draft release of that name, to be looked over and published by hand.
+name: ios-release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The same Python as the app's (Python-Apple-support 3.14): the scripts are compiled ahead
+      # into the bundle only by a Python that makes the same bytecode (port/ios/python.sh).
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+      - run: brew install ninja ccache
+      - uses: ./.github/actions/compiler-cache
+        with:
+          key: ios-game
+          max-size: 1G
+      # MoltenVK's and Python's releases, each checked against its SHA-256 (tools/build_ios.py).
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/ios/downloads
+          key: ios-downloads-${{ hashFiles('tools/build_ios.py') }}
+      - name: Build the app
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          version="${REF#v}"
+          case "$GITHUB_REF" in refs/tags/v*) ;; *) version="dev-${GITHUB_SHA::8}" ;; esac
+          ipa="build/ios/ipa/OpenRAC_rac1-ntsc_${version}_ios.ipa"
+          python tools/build_ios.py rac1-ntsc --device --ipa "$ipa"
+          unzip -l "$ipa" | grep -E "OpenRAC.app/(OpenRAC|Info.plist|Frameworks/Python.framework/Python|python/openrac/tools/extractor.py)$"
+          # The app to share holds nothing of a disc: no disc image and no level among its files.
+          if unzip -l "$ipa" | grep -Ei "\.iso$|/port/ntsc/|iso_data/"; then
+            echo "the .ipa carries game data"; exit 1
+          fi
+          (cd build/ios/ipa && shasum -a 256 "$(basename "$ipa")" > "$(basename "$ipa").sha256")
+          du -h "$ipa"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: openrac-ios
+          path: build/ios/ipa/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: ipa
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: openrac-ios
+          path: ipa
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --draft --title "$TAG" --verify-tag \
+            --notes "Built from $GITHUB_SHA. Bring your own disc: see the README." ipa/*

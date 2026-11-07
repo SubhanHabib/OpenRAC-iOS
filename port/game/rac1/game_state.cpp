@@ -1,0 +1,430 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 the OpenRAC contributors
+//
+// rac1's game state (game_state.h): the per-disc and per-level address tables, and the reads of
+// the camera, the fog and the live mobys from game memory.
+
+#include "game/rac1/game_state.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <format>
+#include <fstream>
+#include <iterator>
+#include <string_view>
+
+#include "common/ps2_float.h"
+#include "openrac/guest.h"
+
+namespace openrac::game::rac1 {
+
+/*
+ * PAL addresses (the US ones, documented in docs/engine and in ReRAC's game_camera_fog.md, are
+ * 0x100 lower here):
+ * - 0x187180: the camera's position (the camera block at 0x187040 + 0x140), game units.
+ * - 0x187390: the camera's rotation rows forward, left, up, which the per-frame camera matrices
+ *   function (func_001F2608) turns into the view matrix at 0x187040.
+ * - 0x18CE00: UpdateViewContext's block: +0xB0 the tangent of half the horizontal field of view,
+ *   +0xB4 the vertical one (the horizontal one times the TV correction).
+ * - 0x16001C / 0x160020: the first moby and the end of the table, as CreateMoby (func_0020D348)
+ *   walks it; a moby is 0x100 bytes and a state of 0xFE or more marks a free slot.
+ */
+const GameAddresses kRac1Pal{0x00187180, 0x00187390, 0x0018CE00, 0x0016001C, 0x00160020, 0.756f, 0x00160FF8, 0x00161010};
+
+/*
+ * The same globals in each level's program, found by comparing the boot program's camera matrices
+ * function (func_001F2608) and CreateMoby (func_0020D348) with their copies in the level's code,
+ * instruction by instruction: the copies differ only in the addresses.
+ */
+const GameAddresses kRac1PalLevels[19] = {
+    {0x00166EC0, 0x001670D0, 0x0016CB40, 0x0016009C, 0x001600A0, 0.756f, 0x00161278, 0x00161290},  // 0
+    {0x001672C0, 0x001674D0, 0x0016CF40, 0x0016005C, 0x00160060, 0.756f, 0x00161238, 0x00161250},  // 1
+    {0x00167440, 0x00167650, 0x0016D0C0, 0x0016005C, 0x00160060, 0.756f, 0x00161238, 0x00161250},  // 2
+    {0x00166F40, 0x00167150, 0x0016CBC0, 0x0016005C, 0x00160060, 0.756f, 0x00161238, 0x00161250},  // 3
+    {0x00166FC0, 0x001671D0, 0x0016CC40, 0x0016005C, 0x00160060, 0.756f, 0x00161238, 0x00161250},  // 4
+    {0x001672C0, 0x001674D0, 0x0016CF40, 0x0016009C, 0x001600A0, 0.756f, 0x00161278, 0x00161290},  // 5
+    {0x00167640, 0x00167850, 0x0016D2C0, 0x0016005C, 0x00160060, 0.756f, 0x00161238, 0x00161250},  // 6
+    {0x00166EC0, 0x001670D0, 0x0016CB40, 0x0016005C, 0x00160060, 0.756f, 0x00161238, 0x00161250},  // 7
+    {0x00167640, 0x00167850, 0x0016D2C0, 0x0016005C, 0x00160060, 0.756f, 0x00161238, 0x00161250},  // 8
+    {0x00166FC0, 0x001671D0, 0x0016CC40, 0x0016005C, 0x00160060, 0.756f, 0x00161238, 0x00161250},  // 9
+    {0x001672C0, 0x001674D0, 0x0016CF40, 0x0016005C, 0x00160060, 0.756f, 0x00161238, 0x00161250},  // 10
+    {0x00167840, 0x00167A50, 0x0016D4C0, 0x0016005C, 0x00160060, 0.756f, 0x00161238, 0x00161250},  // 11
+    {0x001672C0, 0x001674D0, 0x0016CF40, 0x0016005C, 0x00160060, 0.756f, 0x00161238, 0x00161250},  // 12
+    {0x00167140, 0x00167350, 0x0016CDC0, 0x0016005C, 0x00160060, 0.756f, 0x00161238, 0x00161250},  // 13
+    {0x001675C0, 0x001677D0, 0x0016D240, 0x0016009C, 0x001600A0, 0.756f, 0x00161278, 0x00161290},  // 14
+    {0x00167440, 0x00167650, 0x0016D0C0, 0x0016005C, 0x00160060, 0.756f, 0x00161238, 0x00161250},  // 15
+    {0x00167240, 0x00167450, 0x0016CEC0, 0x0016009C, 0x001600A0, 0.756f, 0x00161278, 0x00161290},  // 16
+    {0x00167740, 0x00167950, 0x0016D3C0, 0x0016005C, 0x00160060, 0.756f, 0x00161238, 0x00161250},  // 17
+    {0x00167840, 0x00167A50, 0x0016D4C0, 0x0016005C, 0x00160060, 0.756f, 0x00161238, 0x00161250},  // 18
+};
+
+namespace {
+
+template <typename T>
+T at(std::span<const std::uint8_t> ram, std::uint32_t address) {
+    T value{};
+    address = openrac_guest_ram_address_for_size(address, static_cast<std::uint32_t>(ram.size()));
+    if (address + sizeof(T) <= ram.size()) {
+        std::memcpy(&value, ram.data() + address, sizeof(T));
+    }
+    return value;
+}
+
+renderer::Vec3 vec3(std::span<const std::uint8_t> ram, std::uint32_t address) {
+    return {at<float>(ram, address), at<float>(ram, address + 4), at<float>(ram, address + 8)};
+}
+
+// Column-major rotations about X, Y and Z.
+renderer::Mat4 rotation_x(float a) {
+    const float c = std::cos(a), s = std::sin(a);
+    return {1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1};
+}
+
+renderer::Mat4 rotation_y(float a) {
+    const float c = std::cos(a), s = std::sin(a);
+    return {c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1};
+}
+
+renderer::Mat4 rotation_z(float a) {
+    const float c = std::cos(a), s = std::sin(a);
+    return {c, s, 0, 0, -s, c, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+}
+
+}  // namespace
+
+std::optional<host::LiveMoby> read_live_moby(std::span<const std::uint8_t> ram, std::uint32_t m) {
+    if (m == 0 || m + 0x100 > ram.size()) {
+        return std::nullopt;
+    }
+    const renderer::Vec3 pos = vec3(ram, m + 0x10);
+    const renderer::Vec3 rot = vec3(ram, m + 0x40);
+    const float scale = at<float>(ram, m + 0x2C);
+    if (!std::isfinite(pos[0]) || !std::isfinite(scale) || scale <= 0.0f || scale > 1000.0f) {
+        return std::nullopt;
+    }
+    host::LiveMoby live;
+    live.address = m;
+    live.class_id = at<std::int16_t>(ram, m + 0xA6);
+    live.occlusion = at<std::uint16_t>(ram, m + 0x36);
+    // The animation code maintains this world-space sphere in packed units.
+    std::array<float, 4> sphere;
+    std::memcpy(sphere.data(), ram.data() + m, sizeof(sphere));
+    if (sphere[3] > 0
+        && std::all_of(sphere.begin(), sphere.end(), [](float x) { return std::isfinite(x); })) {
+        for (std::size_t i = 0; i < sphere.size(); ++i) {
+            live.world_sphere[i] = sphere[i] / 1024.0f;
+        }
+    }
+
+    // The rotation rows at +0xC0 (each the image of a model axis), as MobyProc draws it:
+    // MobyBuildMatrix (func_L00_00251E30) makes them from the Euler angles at +0x40 every
+    // update, unless the moby keeps rows of its own (mode 0x100, or an item placed after its
+    // update: the wrench in Ratchet's hand), and negates row 1 with mode 0x8000. The class
+    // mesh is in unscaled units and the moby's scale already includes the class's.
+    const renderer::Vec3 r0 = vec3(ram, m + 0xC0), r1 = vec3(ram, m + 0xD0), r2 = vec3(ram, m + 0xE0);
+    const auto usable = [](const renderer::Vec3& r) {
+        return std::isfinite(r[0]) && std::isfinite(r[1]) && std::isfinite(r[2])
+            && r[0] * r[0] + r[1] * r[1] + r[2] * r[2] > 1.0e-6f;
+    };
+    if (usable(r0) && usable(r1) && usable(r2)) {
+        live.matrix = {r0[0] * scale, r0[1] * scale, r0[2] * scale, 0,
+                       r1[0] * scale, r1[1] * scale, r1[2] * scale, 0,
+                       r2[0] * scale, r2[1] * scale, r2[2] * scale, 0,
+                       pos[0], pos[1], pos[2], 1};
+        return live;
+    }
+    // No rows yet (a moby not built since it was made): X first, then Y, then Z, as the
+    // game's Euler matrices.
+    live.matrix = renderer::multiply(
+        renderer::translation(pos),
+        renderer::multiply(
+            rotation_z(rot[2]),
+            renderer::multiply(
+                rotation_y(rot[1]),
+                renderer::multiply(rotation_x(rot[0]), renderer::scale(scale))
+            )
+        )
+    );
+    return live;
+}
+
+namespace {
+
+// MobyProc's distance tests and fade, instruction for instruction (NTSC-U boot 0x211B60..0x211D20;
+// each level's copy, level 1's at 0x26AAF8, is the same code), on the VU's own arithmetic
+// (common/ps2_float.h: every result cut toward zero). Its inputs, as it loads them: the camera's
+// position (camera block +0x140) times 1024, the view matrix's rows (block +0x00..+0x20), of which
+// the depth takes the third column, the near plane (view context +0xA0) and the global cap on
+// the draw distance. Per moby, with the sphere (x y z r) at +0x00 and the draw distance at +0x32:
+//
+//   v      = sphere.xyz - eye * 1024                      vsub vf2, vf1, vf24
+//   z      = (a.x * v.x + a.y * v.y) + a.z * v.z          vmula / vmadda / vmadd (a: the column)
+//   near   = n - (r + z)                                  vf11 = (1, -1); vaddbc; vsub
+//   far    = (itof(min(dd, cap) << 10) - r) - (-r + z)    pminw; dsll32; vitof0; vsubbc; vsub
+//   culled when far's sign bit is set or near's is clear  qmfc2; bltz / bgez on the lanes
+//   fade   = min(ftoi0(far) >> 7, 0x80)                   vftoi0; dsrl32 7; pminw 0x80
+//
+// So the fade runs over the last 16 units of the draw distance (0x80 << 7 = 16384 = 16 << 10).
+// The moby's vertex alpha is fade * alpha (+0x23) >> 7, and below 0x80 it is drawn with the fading
+// TEST_1 (slti 0x80; sll 3 into the mode bits).
+std::optional<std::uint8_t> moby_proc_distance(
+    const std::uint8_t* moby, const renderer::Vec3& eye, const host::GameState::MobyView& view
+) {
+    using namespace openrac::ps2;
+    u32 sphere[4];
+    std::memcpy(sphere, moby, sizeof(sphere));
+    std::int16_t distance;
+    std::memcpy(&distance, moby + 0x32, sizeof(distance));
+    const u32 units = bits(1024.0f);
+    u32 v[3];
+    for (int i = 0; i < 3; ++i) {
+        v[i] = sub(sphere[i], mul(bits(eye[i]), units));
+    }
+    const auto& a = view.depth_axis;
+    const u32 z = add(add(mul(bits(a[0]), v[0]), mul(bits(a[1]), v[1])), mul(bits(a[2]), v[2]));
+    const u32 r = sphere[3];
+    const u32 near_side = add(mul(kOne, r), z);
+    const u32 far_side = add(mul(kNegOne, r), z);
+    const s32 capped = std::min<s32>(distance, view.draw_cap);
+    const u32 reach = sub(itof0(static_cast<s32>(static_cast<u32>(capped) << 10)), r);
+    const u32 near_test = sub(bits(view.near_plane), near_side);
+    const u32 far_test = sub(reach, far_side);
+    if ((far_test & kSign) != 0 || (near_test & kSign) == 0) {
+        return std::nullopt;
+    }
+    const auto fade = static_cast<u32>(ftoi(far_test, 0)) >> 7;
+    return static_cast<std::uint8_t>(std::min<u32>(fade, 0x80));
+}
+
+// Wholly outside the view's sides, by far: the game's sphere test culls it (the view block's
+// clip constants), and the depth alone does not. Pokitaru's two class 1161 mobys turned by -5 pi
+// have spheres thousands of units to the side; seen at a right angle to them (the camera at 507
+// 411 232 looking -0.474 0.877, a player's report) their depth came within the draw distance and
+// the window drew them: rows thousands long, a cyan cover over the sky and the ground. The bound
+// is a tangent of 8, wider than any picture's field of view, so only such spheres are culled here
+// and every moby the wider pictures show is still drawn.
+bool beyond_the_sides(
+    const float* sphere, const renderer::Vec3& eye, const renderer::Vec3& forward
+) {
+    const float to[3] =
+        {sphere[0] / 1024.0f - eye[0], sphere[1] / 1024.0f - eye[1], sphere[2] / 1024.0f - eye[2]};
+    const float depth = to[0] * forward[0] + to[1] * forward[1] + to[2] * forward[2];
+    const float radius = std::fabs(sphere[3]) / 1024.0f;
+    constexpr float kWidestTangent = 8.0f;
+    const float side2 = to[0] * to[0] + to[1] * to[1] + to[2] * to[2] - depth * depth;
+    const float reach = (depth + radius) * kWidestTangent + radius;
+    return side2 > reach * reach;
+}
+
+}  // namespace
+
+std::optional<std::uint8_t> moby_distance_fade(
+    const std::uint8_t* moby, const host::GameState& state
+) {
+    float sphere[4];
+    std::memcpy(sphere, moby, sizeof(sphere));
+    std::int16_t distance;
+    std::memcpy(&distance, moby + 0x32, sizeof(distance));
+    if (!std::isfinite(sphere[0]) || !std::isfinite(sphere[1]) || !std::isfinite(sphere[2])
+        || !std::isfinite(sphere[3])) {
+        return std::nullopt;
+    }
+    // No sphere yet (a moby not built since it was made): nothing to go by.
+    if (sphere[0] == 0.0f && sphere[1] == 0.0f && sphere[2] == 0.0f && sphere[3] == 0.0f) {
+        return std::uint8_t{0x80};
+    }
+    const auto& eye = state.camera_position;
+    if (state.moby_view) {
+        const auto pass = moby_proc_distance(moby, eye, *state.moby_view);
+        if (!pass) {
+            return std::nullopt;
+        }
+        if (beyond_the_sides(sphere, eye, state.forward)) {
+            return std::nullopt;
+        }
+        return pass;
+    }
+    // A program whose view block is not known: the same tests in the host's floats.
+    const float to[3] =
+        {sphere[0] / 1024.0f - eye[0], sphere[1] / 1024.0f - eye[1], sphere[2] / 1024.0f - eye[2]};
+    const auto& forward = state.forward;
+    const float depth = to[0] * forward[0] + to[1] * forward[1] + to[2] * forward[2];
+    const float radius = std::fabs(sphere[3]) / 1024.0f;
+    if (depth > static_cast<float>(distance) || depth + radius <= 32.0f / 1024.0f
+        || beyond_the_sides(sphere, eye, forward)) {
+        return std::nullopt;
+    }
+    return std::uint8_t{0x80};
+}
+
+host::GameState read_game_state(std::span<const std::uint8_t> ram, const GameAddresses& a) {
+    host::GameState s;
+    s.camera_position = vec3(ram, a.camera_position);
+    // Camera block +0x180 is the active UpdateCam pointer; the eye is at +0x140.
+    // The default follow record (id +0x86 == 0) owns FollowCamState at +0x70,
+    // whose +0x40 focus is eased by follow_cam_focus_velocity/follow_camera_springs.
+    // Other camera records have different saved-state layouts: never interpret them as follow data.
+    const auto record = at<std::uint32_t>(ram, a.camera_position + 0x40) & 0x1FFFFFFFu;
+    if (record != 0 && record + 0xA0 <= ram.size() && at<std::int16_t>(ram, record + 0x86) == 0) {
+        const auto saved = at<std::uint32_t>(ram, record + 0x70) & 0x1FFFFFFFu;
+        if (saved != 0 && saved + 0x50 <= ram.size()) {
+            const auto focus = vec3(ram, saved + 0x40);
+            if (std::all_of(focus.begin(), focus.end(), [](float v) {
+                    return std::isfinite(v) && std::abs(v) < 1000000.f;
+                })) {
+                s.camera_target = focus;
+                s.camera_target_id = (std::uint64_t(record) << 32) | saved;
+            }
+        }
+    }
+    s.forward = vec3(ram, a.camera_rows);
+    // What MobyProc loads (moby_proc_distance): the view matrix at the camera block (the eye's
+    // +0x140 back), whose third column the depth takes, the near plane at the view context's
+    // +0xA0, and the cap on the draw distance 0x10 past the moby table's end pointer (D_0015FF30
+    // in the boot program, gp-0x6CD0; each level's copy reads its own as far past its table's).
+    host::GameState::MobyView moby_view;
+    const std::uint32_t view = a.camera_position - 0x140;
+    for (int i = 0; i < 3; ++i) {
+        moby_view.depth_axis[static_cast<std::size_t>(i)] = at<float>(ram, view + 0x08 + 0x10 * i);
+    }
+    moby_view.near_plane = at<float>(ram, a.view_context + 0xA0);
+    moby_view.draw_cap = at<std::int32_t>(ram, a.moby_end + 0x10);
+    s.moby_view = moby_view;
+    s.left = vec3(ram, a.camera_rows + 0x10);
+    s.up = vec3(ram, a.camera_rows + 0x20);
+
+    const float tx = at<float>(ram, a.view_context + 0xB0);
+    const float ty = at<float>(ram, a.view_context + 0xB4);
+    if (tx > 0.05f && tx < 10.0f) {
+        s.tan_half_fov_x = tx;
+        s.tan_half_fov_y = ty > 0.05f && ty < 10.0f ? ty : tx * a.vertical_factor;
+    }
+    const float fx = at<float>(ram, a.view_context + 0xC0) * 32.0f;
+    const float fy = at<float>(ram, a.view_context + 0xD4) * 32.0f;
+    if (fx > 16.0f && fx < 4096.0f && fy > 16.0f && fy < 4096.0f) {
+        s.focal_x = fx;
+        s.focal_y = fy;
+    }
+
+    // UpdateFog (func_001F2930): the colour as three words at +0x230, then near and far depth
+    // at +0x218 and +0x21C, near and far F at +0x228 and +0x22C.
+    for (int c = 0; c < 3; ++c) {
+        s.fog_colour[c] = static_cast<float>(at<std::uint32_t>(ram, a.view_context + 0x230 + 4 * c) & 0xFF) / 255.0f;
+    }
+    s.fog_near = at<float>(ram, a.view_context + 0x218);
+    s.fog_far = at<float>(ram, a.view_context + 0x21C);
+    s.fog_near_f = at<float>(ram, a.view_context + 0x228);
+    s.fog_far_f = at<float>(ram, a.view_context + 0x22C);
+
+    // The level settings' background colour (the gameplay file's first record), which the gameplay
+    // loader puts at +0x23C, +0x240 and +0x244 as three words and hands to SetBackgroundColor:
+    // the RGBAQ of the frame's clear packet. The edges of the sky show it.
+    std::array<float, 3> background{};
+    for (int c = 0; c < 3; ++c) {
+        background[c] =
+            static_cast<float>(at<std::uint32_t>(ram, a.view_context + 0x23C + 4 * c) & 0xFF)
+            / 255.0f;
+    }
+    s.background_colour = background;
+
+    // The table starts at the word before moby_first (the mobys the level places, the hero first);
+    // moby_first itself is where the spawned ones begin.
+    auto first = openrac_guest_ram_address_for_size(
+        at<std::uint32_t>(ram, a.moby_first), static_cast<std::uint32_t>(ram.size())
+    );
+    const auto end = openrac_guest_ram_address_for_size(
+        at<std::uint32_t>(ram, a.moby_end), static_cast<std::uint32_t>(ram.size())
+    );
+    const auto start = openrac_guest_ram_address_for_size(
+        at<std::uint32_t>(ram, a.moby_first - 4), static_cast<std::uint32_t>(ram.size())
+    );
+    if (start != 0 && start < first && (first - start) % 0x100 == 0) {
+        first = start;
+    }
+    if (first == 0 || end <= first || end > ram.size() || (end - first) % 0x100 != 0) {
+        return s;
+    }
+    for (std::uint32_t m = first; m < end; m += 0x100) {
+        // A state with its sign bit set is no moby any more: 0xFD a deleted moby of the level's own
+        // (its slot is never used again, and it keeps its last position: a bolt picked up), 0xFE a
+        // deleted spawned one, 0xFF the end of the used part. The game's own loops skip them by the
+        // sign (the update's activity gate, MobyBuildMatrix, the groups' counts).
+        if (at<std::uint8_t>(ram, m + 0x20) >= 0x80) {
+            continue;
+        }
+        if (const auto live = read_live_moby(ram, m)) {
+            s.mobys.push_back(*live);
+        }
+    }
+    return s;
+}
+
+std::uint32_t shown_chain(std::span<const std::uint8_t> ram, const GameAddresses& a) {
+    const auto building = at<std::uint32_t>(ram, a.chain_index) & 1;
+    return at<std::uint32_t>(ram, a.chain_bases + 4 * (1 - building));
+}
+
+/*
+ * NTSC-U (SCUS-97199): the same globals, each found from PAL's by the version map
+ * (port/tools/versionmap): the address the same instruction of the same function forms in that
+ * version's program. The vertical factor is PAL's, not yet measured on NTSC-U.
+ */
+const GameAddresses kRac1Ntsc{0x00187080, 0x00187290, 0x0018CD00, 0x0015FF1C, 0x0015FF20, 0.756f, 0x00160EF8, 0x00160F10};
+const GameAddresses kRac1NtscLevels[19] = {
+    {0x00166DC0, 0x00166FD0, 0x0016CA40, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 0
+    {0x00167240, 0x00167450, 0x0016CEC0, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 1
+    {0x001673C0, 0x001675D0, 0x0016D040, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 2
+    {0x00166EC0, 0x001670D0, 0x0016CB40, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 3
+    {0x00166F40, 0x00167150, 0x0016CBC0, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 4
+    {0x001671C0, 0x001673D0, 0x0016CE40, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 5
+    {0x00167540, 0x00167750, 0x0016D1C0, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 6
+    {0x00166E40, 0x00167050, 0x0016CAC0, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 7
+    {0x001675C0, 0x001677D0, 0x0016D240, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 8
+    {0x00166F40, 0x00167150, 0x0016CBC0, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 9
+    {0x00167240, 0x00167450, 0x0016CEC0, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 10
+    {0x001677C0, 0x001679D0, 0x0016D440, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 11
+    {0x00167240, 0x00167450, 0x0016CEC0, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 12
+    {0x001670C0, 0x001672D0, 0x0016CD40, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 13
+    {0x001674C0, 0x001676D0, 0x0016D140, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 14
+    {0x001673C0, 0x001675D0, 0x0016D040, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 15
+    {0x001671C0, 0x001673D0, 0x0016CE40, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 16
+    {0x001676C0, 0x001678D0, 0x0016D340, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 17
+    {0x001677C0, 0x001679D0, 0x0016D440, 0x0015FFDC, 0x0015FFE0, 0.756f, 0x001611B8, 0x001611D0},  // 18
+};
+
+const GameAddresses& rac1_addresses(std::string_view game, int level) {
+    const bool ntsc = game == "rac1-ntsc";
+    const std::span<const GameAddresses> levels =
+        ntsc ? std::span<const GameAddresses>(kRac1NtscLevels)
+             : std::span<const GameAddresses>(kRac1PalLevels);
+    if (level >= 0 && static_cast<std::size_t>(level) < levels.size()) {
+        return levels[level];
+    }
+    return ntsc ? kRac1Ntsc : kRac1Pal;
+}
+
+const GameAddresses& rac1_pal_addresses(std::span<const std::uint8_t> ram) {
+    const auto level = at<std::int32_t>(ram, 0x0015EE84);
+    return level >= 0 && static_cast<std::size_t>(level) < std::size(kRac1PalLevels)
+               ? kRac1PalLevels[level]
+               : kRac1Pal;
+}
+
+bool load_memory(const std::filesystem::path& path, std::vector<std::uint8_t>& out, std::string& error) {
+    std::ifstream f(path, std::ios::binary);
+    out.assign(std::istreambuf_iterator<char>(f), {});
+    if (out.size() != GUEST_RAM_SIZE && out.size() != GUEST_RAM_EXPANDED_SIZE) {
+        error = std::format(
+            "{}: memory picture is {} bytes; expected a 16 MiB multiple from {} through {}",
+            path.string(),
+            out.size(),
+            GUEST_RAM_SIZE,
+            GUEST_RAM_EXPANDED_SIZE
+        );
+        return false;
+    }
+    return true;
+}
+
+}  // namespace openrac::game::rac1
